@@ -70,42 +70,45 @@ def hadamard(b, n, dtype):
                         local[chunkbase + k] = local[chunkbase + k] + local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - 2 * local[chunkbase + k + chunksize // 2]
 
-            # 4. Hadamard inside warp, n<=512
-            # In warp level, we can directly compute on shared memory, since warps are scheduled simultaneously
-            for i in T.vectorized(thread_elem):
-                shared[tx, i] = local[i]
+            for cur_round in T.serial(exchange_round):
+                exchange_base = thread_elem_in_smem * cur_round
+
+                # 3. Hadamard inside warp, n<=512
+                # In warp level, we can directly compute on shared memory, since warps are scheduled simultaneously
+                for i in T.vectorized(thread_elem_in_smem):
+                    shared[tx, i] = local[exchange_base + i]
             
-            for i in T.serial(warp_round):
-                tx_stride = 1 << i
-                sign = (tx >> i) & 1 # get i-th lowest bit of tx, which determines the operation type for shared[tx, :]
-                for j in T.vectorized(thread_elem):
-                    shared[tx, j] = T.if_then_else(
-                        sign == 0,
-                        shared[tx, j] + shared[tx ^ tx_stride, j],
-                        shared[tx ^ tx_stride, j] - shared[tx, j]
-                    )
+                for i in T.serial(warp_round):
+                    tx_stride = 1 << i
+                    sign = (tx >> i) & 1 # get i-th lowest bit of tx, which determines the operation type for shared[tx, :]
+                    for j in T.Pipelined(thread_elem_in_smem, num_stages=2):
+                        shared[tx, j] = T.if_then_else(
+                            sign == 0,
+                            shared[tx, j] + shared[tx ^ tx_stride, j],
+                            shared[tx ^ tx_stride, j] - shared[tx, j]
+                        )
                     
-            for i in T.vectorized(thread_elem):
-                local[i] = shared[tx, i]
+                for i in T.vectorized(thread_elem_in_smem):
+                    local[exchange_base+i] = shared[tx, i]
             
-            # 5. Hadamard inside block, n<=32768
-            # Only exchange once for n<=8192, since shared mem can hold all elems
-            for i in T.serial(block_round):
-                tx_stride = 1 << (warp_round + i)
-                sign = (tx >> (warp_round + i)) & 1 # get i-th lowest bit of tx, which determines the operation type for shared[tx, :]
-                for j in T.vectorized(thread_elem):
-                    local[j] = T.if_then_else(
-                        sign == 0,
-                        local[j] + shared[tx ^ tx_stride, j],
-                        shared[tx ^ tx_stride, j] - local[j]
-                    )
-                
-                for j in T.vectorized(thread_elem):
-                    shared[tx, j] = local[j]
+                # 4. Hadamard inside block, n<=32768
+                # Only exchange once for n<=8192, since shared mem can hold all elems
+                for i in T.serial(block_round):
+                    tx_stride = 1 << (warp_round + i)
+                    sign = (tx >> (warp_round + i)) & 1 # get i-th lowest bit of tx, which determines the operation type for shared[tx, :]
+                    for j in T.Pipelined(thread_elem_in_smem, num_stages=2):
+                        local[exchange_base+j] = T.if_then_else(
+                            sign == 0,
+                            local[exchange_base+j] + shared[tx ^ tx_stride, j],
+                            shared[tx ^ tx_stride, j] - local[exchange_base+j]
+                        )
+                    
+                    for j in T.vectorized(thread_elem_in_smem):
+                        shared[tx, j] = local[exchange_base+j]
             
-            # 6. Write back to HBM
+            # 5. Write back to HBM
             for i in T.vectorized(thread_elem):
-                B[bx, tx*thread_elem + i] = shared[tx, i]
+                B[bx, tx*thread_elem + i] = local[i]
             
     return main
 
